@@ -1,0 +1,18 @@
+[submodule ".config/niri"]
+	path = .config/niri
+	url = git@github.com:wandabastyle/niri.git
+[submodule ".config/waybar"]
+	path = .config/waybar
+	url = git@github.com:wandabastyle/waybar.git
+[submodule ".config/ghostty"]
+	path = .config/ghostty
+	url = git@github.com:wandabastyle/ghostty.git
+[submodule ".config/fish"]
+	path = .config/fish
+	url = git@github.com:wandabastyle/fish.git
+[submodule "wallpaper"]
+	path = wallpaper
+	url = git@github.com:wandabastyle/wallpaper.git
+[submodule ".config/nvim"]
+	path = .config/nvim
+	url = git@github.com:wandabastyle/nvim.git
