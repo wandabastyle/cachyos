@@ -16,3 +16,9 @@
 [submodule ".config/nvim"]
 	path = .config/nvim
 	url = git@github.com:wandabastyle/nvim.git
+[submodule ".config/qutebrowser"]
+	path = .config/qutebrowser
+	url = git@github.com:wandabastyle/qutebrowser.git
+[submodule ".config/rofi"]
+	path = .config/rofi
+	url = git@github.com:wandabastyle/rofi.git
