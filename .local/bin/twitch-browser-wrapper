@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+url="$1"
+
+# Change this if you want Firefox or something else
+NORMAL_BROWSER="/usr/bin/brave"
+
+if [[ "$url" == https://www.twitch.tv/* ]] || [[ "$url" == https://twitch.tv/* ]]; then
+    # Open Twitch link as an "app window" in your Brave Default profile
+    exec /usr/bin/brave --profile-directory=Default --app="$url"
+else
+    exec "$NORMAL_BROWSER" "$url"
+fi
+
