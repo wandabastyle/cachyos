@@ -1,9 +1,6 @@
 [submodule ".config/niri"]
 	path = .config/niri
 	url = git@github.com:wandabastyle/niri.git
-[submodule ".config/waybar"]
-	path = .config/waybar
-	url = git@github.com:wandabastyle/waybar.git
 [submodule ".config/ghostty"]
 	path = .config/ghostty
 	url = git@github.com:wandabastyle/ghostty.git
