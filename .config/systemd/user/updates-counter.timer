@@ -1,0 +1,13 @@
+# ~/.config/systemd/user/updates-counter.timer
+[Unit]
+Description=Run updates counter 4 times a day
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 0/6:00:00
+Persistent=true
+Unit=updates-counter.service
+
+[Install]
+WantedBy=timers.target
+
