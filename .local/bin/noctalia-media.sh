@@ -5,7 +5,7 @@ SPEED=3          # characters per second (tweak this)
 EMPTY_MARKER="__NO_TRACK__"   # what we'll use for textCollapse
 
 # Get metadata from playerctl
-full=$(playerctl -p SongRec metadata --format '{{artist}} – {{title}} ({{album}})' 2>/dev/null)
+full=$(playerctl -p re.fossplant.songrec metadata --format '{{artist}} – {{title}} ({{album}})' 2>/dev/null)
 
 # Nothing playing / no metadata: output marker so the widget can collapse
 if [ -z "$full" ]; then
