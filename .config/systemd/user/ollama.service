@@ -1,0 +1,9 @@
+[Unit]
+Description=Ollama Server
+
+[Service]
+ExecStart=/usr/bin/ollama serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

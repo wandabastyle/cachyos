@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop Ollama after TTL
+
+[Timer]
+OnActiveSec=10m
+Unit=ollama-stop.service
+
+[Install]
+WantedBy=timers.target

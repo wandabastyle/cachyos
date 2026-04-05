@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop Ollama
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user stop ollama.service
