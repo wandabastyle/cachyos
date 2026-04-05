@@ -19,3 +19,6 @@
 [submodule ".config/rofi"]
 	path = .config/rofi
 	url = git@github.com:wandabastyle/rofi.git
+[submodule ".config/lazygit"]
+	path = .config/lazygit
+	url = git@github.com:wandabastyle/lazygit.git
