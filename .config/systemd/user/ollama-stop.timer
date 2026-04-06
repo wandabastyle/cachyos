@@ -1,8 +1,8 @@
 [Unit]
-Description=Stop Ollama after TTL
+Description=Stop Ollama after idle delay
 
 [Timer]
-OnActiveSec=10m
+OnActiveSec=15min
 Unit=ollama-stop.service
 
 [Install]
