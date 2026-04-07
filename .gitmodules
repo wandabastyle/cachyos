@@ -25,3 +25,6 @@
 [submodule ".config/quickshell"]
 	path = .config/quickshell
 	url = git@github.com:wandabastyle/quickshell.git
+[submodule ".config/noctalia"]
+	path = .config/noctalia
+	url = git@github.com:wandabastyle/noctalia.git
