@@ -14,7 +14,29 @@ Quick SSH check:
 ssh -T git@github.com
 ```
 
-## 1) Clone the repo (with submodules)
+## 1) Install yay (if missing)
+
+Install build prerequisites:
+
+```bash
+sudo pacman -S --needed base-devel git
+```
+
+Clone and build `yay` from AUR:
+
+```bash
+git clone https://aur.archlinux.org/yay.git /tmp/yay
+cd /tmp/yay
+makepkg -si
+```
+
+Verify:
+
+```bash
+yay --version
+```
+
+## 2) Clone the repo (with submodules)
 
 ```bash
 git clone --recurse-submodules git@github.com:<your-user>/dotfiles.git "$HOME/dotfiles"
@@ -27,7 +49,7 @@ If already cloned without submodules:
 git submodule update --init --recursive
 ```
 
-## 2) Install required tools with yay
+## 3) Install required tools with yay
 
 ```bash
 yay -S --needed \
@@ -48,7 +70,7 @@ Optional but used by local scripts/config:
 yay -S --needed brave-bin wofi mpv
 ```
 
-## 3) Deploy dotfiles with GNU Stow
+## 4) Deploy dotfiles with GNU Stow
 
 From repo root:
 
@@ -62,7 +84,7 @@ Notes:
 - `.stow-local-ignore` excludes repo metadata and `wallpaper` from symlinking.
 - Re-run `stow -t "$HOME" .config .local` after updates.
 
-## 4) Sync submodules after pulling updates
+## 5) Sync submodules after pulling updates
 
 ```bash
 cd "$HOME/dotfiles"
@@ -70,7 +92,7 @@ git pull --recurse-submodules
 git submodule update --init --recursive --remote
 ```
 
-## 5) User services/timers
+## 6) User services/timers
 
 Reload user units:
 
@@ -92,7 +114,7 @@ systemctl --user status updates-counter.timer
 
 Ollama is used by Neovim/Python commit tooling and is handled there; no manual systemd setup is required in onboarding.
 
-## 6) First-run checks
+## 7) First-run checks
 
 ### Neovim
 
@@ -124,7 +146,7 @@ Confirm key apps exist:
 command -v niri ghostty rofi qutebrowser qs niriswitcher
 ```
 
-## 7) Daily maintenance
+## 8) Daily maintenance
 
 Update packages:
 
