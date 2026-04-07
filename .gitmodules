@@ -22,3 +22,6 @@
 [submodule ".config/lazygit"]
 	path = .config/lazygit
 	url = git@github.com:wandabastyle/lazygit.git
+[submodule ".config/quickshell"]
+	path = .config/quickshell
+	url = git@github.com:wandabastyle/quickshell.git
