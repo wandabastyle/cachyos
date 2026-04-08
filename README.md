@@ -54,13 +54,13 @@ git submodule update --init --recursive
 ```bash
 yay -S --needed \
   git stow \
-  neovim-git ripgrep fd nodejs python stylua shellcheck shfmt clang \
-  lua-language-server nil rust-analyzer basedpyright typescript typescript-language-server \
+  neovim-git ripgrep fd python stylua shellcheck shfmt clang \
+  lua-language-server nil rust-analyzer basedpyright typescript-language-server \
   lazygit ollama \
   fish starship zoxide eza bat \
   ghostty qutebrowser rofi niri swayidle pcmanfm-qt \
-  quickshell niriswitcher \
-  playerctl brightnessctl wireplumber pipewire pipewire-pulse \
+  noctalia-shell niriswitcher \
+  playerctl brightnessctl wireplumber pipewire-pulse \
   pacman-contrib
 ```
 
