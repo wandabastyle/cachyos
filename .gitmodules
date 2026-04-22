@@ -28,3 +28,6 @@
 [submodule ".config/noctalia"]
 	path = .config/noctalia
 	url = git@github.com:wandabastyle/noctalia.git
+[submodule ".config/tmux"]
+	path = .config/tmux
+	url = git@github.com:wandabastyle/tmux.git
