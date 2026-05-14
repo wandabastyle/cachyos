@@ -1,0 +1,13 @@
+# ~/.config/systemd/user/nirinit.service
+[Unit]
+Description=nirinit session restore for niri
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/nirinit --save-interval 300
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
