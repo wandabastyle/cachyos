@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.cargo/bin/nirinit --save-interval 300
+ExecStart=/usr/bin/nirinit --save-interval 300
 Restart=on-failure
 RestartSec=2
 
