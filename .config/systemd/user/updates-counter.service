@@ -5,8 +5,7 @@ Description=Count available Arch + AUR updates
 [Service]
 Type=oneshot
 ExecStartPre=/usr/bin/mkdir -p %h/.cache
-ExecStart=/usr/bin/bash -lc 'echo $(( $(checkupdates 2>/dev/null | wc -l) + $(yay -Qua 2>/dev/null | wc -l) )) > "$HOME/.cache/updates-count"'
+ExecStart=%h/.local/bin/updates-counter
 
 [Install]
 WantedBy=default.target
-

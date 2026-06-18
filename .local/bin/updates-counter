@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CACHE_DIR="${HOME}/.cache"
+COUNT_FILE="${CACHE_DIR}/updates-count"
+TOOLTIP_FILE="${CACHE_DIR}/updates-tooltip"
+WIDGET_FILE="${CACHE_DIR}/updates-widget.json"
+
+mkdir -p "${CACHE_DIR}"
+
+if ! command -v jq >/dev/null 2>&1; then
+    printf '0\n' > "${COUNT_FILE}"
+    printf 'jq is required to build update widget data\n' > "${TOOLTIP_FILE}"
+    exit 1
+fi
+
+repo_updates=$(mktemp)
+aur_updates=$(mktemp)
+plain_tooltip=$(mktemp)
+rich_tooltip=$(mktemp)
+trap 'rm -f "${repo_updates}" "${aur_updates}" "${plain_tooltip}" "${rich_tooltip}"' EXIT
+
+while read -r pkg oldver arrow newver rest; do
+    [[ -z "${pkg:-}" ]] && continue
+
+    repo=$(LC_ALL=C pacman -Si "${pkg}" 2>/dev/null | awk '/^Repository/ {print $3; exit}')
+    [[ -z "${repo}" ]] && repo="repo"
+
+    if [[ -n "${rest:-}" ]]; then
+        newver="${newver} ${rest}"
+    fi
+
+    printf '%s\t%s\t%s\t%s\n' "${repo}" "${pkg}" "${oldver}" "${newver}" >> "${repo_updates}"
+done < <(checkupdates 2>/dev/null || true)
+
+while read -r pkg oldver arrow newver rest; do
+    [[ -z "${pkg:-}" ]] && continue
+
+    if [[ -n "${rest:-}" ]]; then
+        newver="${newver} ${rest}"
+    fi
+
+    printf 'AUR\t%s\t%s\t%s\n' "${pkg}" "${oldver}" "${newver}" >> "${aur_updates}"
+done < <(yay -Qua 2>/dev/null || true)
+
+repo_count=$(wc -l < "${repo_updates}")
+aur_count=$(wc -l < "${aur_updates}")
+total_count=$((repo_count + aur_count))
+
+append_section() {
+    local source_file=$1
+    local repo=$2
+    local heading_color=$3
+    local section_count
+
+    section_count=$(awk -F '\t' -v repo="${repo}" '$1 == repo {count++} END {print count + 0}' "${source_file}")
+    [[ "${section_count}" -eq 0 ]] && return
+
+    if [[ -s "${plain_tooltip}" ]]; then
+        printf '\n' >> "${plain_tooltip}"
+        printf '\n' >> "${rich_tooltip}"
+    fi
+
+    printf '[%s] - %s packages\n' "${repo}" "${section_count}" >> "${plain_tooltip}"
+    printf '<b><font color="%s">[%s] - %s packages</font></b>\n' "${heading_color}" "${repo}" "${section_count}" >> "${rich_tooltip}"
+
+    awk -F '\t' -v repo="${repo}" '$1 == repo {print $2 "\t" $3 "\t" $4}' "${source_file}" |
+        sort -f |
+        while IFS=$'\t' read -r pkg oldver newver; do
+            printf '%s\n  %s -> %s\n' "${pkg}" "${oldver}" "${newver}" >> "${plain_tooltip}"
+            printf '%s\n<font color="#9aa5ce">%s</font> <font color="#c0caf5">→</font> <font color="#9ece6a">%s</font>\n' "${pkg}" "${oldver}" "${newver}" >> "${rich_tooltip}"
+        done
+}
+
+if [[ "${total_count}" -eq 0 ]]; then
+    printf 'No updates available\n' > "${plain_tooltip}"
+    printf '<font color="#9ece6a">No updates available</font>\n' > "${rich_tooltip}"
+else
+    while IFS= read -r repo; do
+        append_section "${repo_updates}" "${repo}" "#7aa2f7"
+    done < <(cut -f1 "${repo_updates}" | sort -u)
+
+    append_section "${aur_updates}" "AUR" "#bb9af7"
+fi
+
+printf '%s\n' "${total_count}" > "${COUNT_FILE}"
+cp "${plain_tooltip}" "${TOOLTIP_FILE}"
+
+rich_tooltip_content=$(printf '<div align="left">\n'; cat "${rich_tooltip}"; printf '</div>')
+
+jq -cn \
+    --arg text "${total_count}" \
+    --arg tooltip "${rich_tooltip_content}" \
+    '{text: $text, tooltip: $tooltip, icon: "packages"}' > "${WIDGET_FILE}"
