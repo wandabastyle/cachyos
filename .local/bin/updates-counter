@@ -6,6 +6,8 @@ CACHE_DIR="${HOME}/.cache"
 COUNT_FILE="${CACHE_DIR}/updates-count"
 TOOLTIP_FILE="${CACHE_DIR}/updates-tooltip"
 WIDGET_FILE="${CACHE_DIR}/updates-widget.json"
+MAX_PER_SECTION=8
+ICON_GLYPH=""
 
 mkdir -p "${CACHE_DIR}"
 
@@ -19,7 +21,10 @@ repo_updates=$(mktemp)
 aur_updates=$(mktemp)
 plain_tooltip=$(mktemp)
 rich_tooltip=$(mktemp)
-trap 'rm -f "${repo_updates}" "${aur_updates}" "${plain_tooltip}" "${rich_tooltip}"' EXIT
+tmp_count=$(mktemp "${CACHE_DIR}/updates-count.XXXXXX")
+tmp_tooltip=$(mktemp "${CACHE_DIR}/updates-tooltip.XXXXXX")
+tmp_widget=$(mktemp "${CACHE_DIR}/updates-widget.json.XXXXXX")
+trap 'rm -f "${repo_updates}" "${aur_updates}" "${plain_tooltip}" "${rich_tooltip}" "${tmp_count}" "${tmp_tooltip}" "${tmp_widget}"' EXIT
 
 while read -r pkg oldver arrow newver rest; do
     [[ -z "${pkg:-}" ]] && continue
@@ -53,6 +58,7 @@ append_section() {
     local repo=$2
     local heading_color=$3
     local section_count
+    local shown_count
 
     section_count=$(awk -F '\t' -v repo="${repo}" '$1 == repo {count++} END {print count + 0}' "${source_file}")
     [[ "${section_count}" -eq 0 ]] && return
@@ -62,15 +68,22 @@ append_section() {
         printf '\n' >> "${rich_tooltip}"
     fi
 
+    shown_count=$((section_count < MAX_PER_SECTION ? section_count : MAX_PER_SECTION))
+
     printf '[%s] - %s packages\n' "${repo}" "${section_count}" >> "${plain_tooltip}"
     printf '<b><font color="%s">[%s] - %s packages</font></b>\n' "${heading_color}" "${repo}" "${section_count}" >> "${rich_tooltip}"
-
     awk -F '\t' -v repo="${repo}" '$1 == repo {print $2 "\t" $3 "\t" $4}' "${source_file}" |
         sort -f |
+        head -n "${MAX_PER_SECTION}" |
         while IFS=$'\t' read -r pkg oldver newver; do
-            printf '%s\n  %s -> %s\n' "${pkg}" "${oldver}" "${newver}" >> "${plain_tooltip}"
-            printf '%s\n<font color="#9aa5ce">%s</font> <font color="#c0caf5">→</font> <font color="#9ece6a">%s</font>\n' "${pkg}" "${oldver}" "${newver}" >> "${rich_tooltip}"
+            printf '%s: %s -> %s\n' "${pkg}" "${oldver}" "${newver}" >> "${plain_tooltip}"
+            printf '<font color="#c0caf5">%s</font>: <font color="#9aa5ce">%s</font> <font color="#c0caf5">→</font> <font color="#9ece6a">%s</font>\n' "${pkg}" "${oldver}" "${newver}" >> "${rich_tooltip}"
         done
+
+    if [[ "${section_count}" -gt "${shown_count}" ]]; then
+        printf '... and %s more\n' "$((section_count - shown_count))" >> "${plain_tooltip}"
+        printf '<font color="#9aa5ce">... and %s more</font>\n' "$((section_count - shown_count))" >> "${rich_tooltip}"
+    fi
 }
 
 if [[ "${total_count}" -eq 0 ]]; then
@@ -84,12 +97,22 @@ else
     append_section "${aur_updates}" "AUR" "#bb9af7"
 fi
 
-printf '%s\n' "${total_count}" > "${COUNT_FILE}"
-cp "${plain_tooltip}" "${TOOLTIP_FILE}"
+printf '%s\n' "${total_count}" > "${tmp_count}"
+cp "${plain_tooltip}" "${tmp_tooltip}"
 
 rich_tooltip_content=$(printf '<div align="left">\n'; cat "${rich_tooltip}"; printf '</div>')
+widget_text="0"
+if [[ "${total_count}" -gt 0 ]]; then
+    widget_text="${ICON_GLYPH} ${total_count}"
+fi
 
 jq -cn \
-    --arg text "${total_count}" \
+    --arg text "${widget_text}" \
     --arg tooltip "${rich_tooltip_content}" \
-    '{text: $text, tooltip: $tooltip, icon: "packages"}' > "${WIDGET_FILE}"
+    '{text: $text, tooltip: $tooltip, icon: "packages"}' > "${tmp_widget}"
+
+jq empty "${tmp_widget}"
+
+mv "${tmp_count}" "${COUNT_FILE}"
+mv "${tmp_tooltip}" "${TOOLTIP_FILE}"
+mv "${tmp_widget}" "${WIDGET_FILE}"
