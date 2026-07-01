@@ -1,0 +1,1115 @@
+#!/usr/bin/env python3
+"""
+songrec-spotify
+
+A small local helper that adds songs recognized by SongRec (or any
+"Artist - Title" / "Artist – Title" string) to a Spotify playlist.
+
+Subcommands:
+    auth                  Browser-based Spotify login with PKCE.
+    list-playlists        Show your Spotify playlists.
+    select-playlist       Pick a playlist interactively and save it to config.
+    create-playlist NAME  Create a new private playlist and use it.
+    add "Artist - Title"  Search Spotify, match confidently, add to playlist.
+    add --from-clipboard  Read clipboard (wl-paste) then behave like `add`.
+    test "Artist - Title" Everything except actually adding to the playlist.
+
+Config:   ~/.config/songrec-spotify/config.toml
+Tokens:   ~/.config/songrec-spotify/token.json
+
+Setup:
+    1. Create a Spotify app at https://developer.spotify.com/dashboard
+    2. Edit Settings and add redirect URI:
+       http://127.0.0.1:8888/callback
+    3. Copy the Client ID.
+    4. Create ~/.config/songrec-spotify/config.toml:
+
+       client_id = "YOUR_CLIENT_ID"
+       playlist_id = ""
+       redirect_uri = "http://127.0.0.1:8888/callback"
+
+    5. Run: songrec-spotify auth
+    6. Either create a playlist:
+           songrec-spotify create-playlist "SongRec Shazams"
+       Or pick an existing one:
+           songrec-spotify list-playlists
+           songrec-spotify select-playlist
+    7. Test:
+           songrec-spotify test "The Prodigy - Climbatize"
+    8. Add:
+           songrec-spotify add "The Prodigy - Climbatize"
+
+Quickshell integration example (MediaMini.qml):
+
+    onClicked: Quickshell.execDetached([
+        "songrec-spotify",
+        "add",
+        title
+    ])
+
+Dependencies: Python 3.11+ (uses tomllib), wl-paste, notify-send, a browser.
+No client secret is required thanks to PKCE.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import tomllib
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Configuration paths
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".config" / "songrec-spotify"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+TOKEN_FILE = CONFIG_DIR / "token.json"
+
+SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+
+REQUIRED_SCOPES = "playlist-modify-private playlist-modify-public"
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+NO_NOTIFY = False
+
+
+def notify(title: str, message: str = "", urgency: str = "normal") -> None:
+    """Best-effort desktop notification via notify-send."""
+    if NO_NOTIFY:
+        return
+    if not shutil_which("notify-send"):
+        return
+    args = ["notify-send", "-u", urgency, title]
+    if message:
+        args.append(message)
+    try:
+        subprocess.run(args, check=False, capture_output=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Shell helpers
+# ---------------------------------------------------------------------------
+
+def shutil_which(name: str) -> str | None:
+    try:
+        import shutil
+        return shutil.which(name)
+    except Exception:
+        return None
+
+
+def read_clipboard() -> str:
+    """Read Wayland clipboard text using wl-paste."""
+    for cmd in ["wl-paste", "xclip", "xsel"]:
+        path = shutil_which(cmd)
+        if not path:
+            continue
+        try:
+            if cmd == "wl-paste":
+                result = subprocess.run(
+                    [path, "-n"], capture_output=True, text=True, check=True
+                )
+            elif cmd == "xclip":
+                result = subprocess.run(
+                    [path, "-selection", "clipboard", "-o"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            else:
+                result = subprocess.run(
+                    [path, "-b", "-o"], capture_output=True, text=True, check=True
+                )
+            return result.stdout.strip()
+        except Exception:
+            continue
+    raise RuntimeError(
+        "Could not read clipboard. Install wl-paste (Wayland) or xclip/xsel (X11)."
+    )
+
+
+def open_url(url: str) -> None:
+    """Open a URL in the default browser."""
+    try:
+        webbrowser.open(url)
+    except Exception:
+        # Fallback to xdg-open
+        xdg = shutil_which("xdg-open")
+        if xdg:
+            subprocess.run([xdg, url], check=False)
+
+
+# ---------------------------------------------------------------------------
+# Config / token loading
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_FILE.exists():
+        raise RuntimeError(
+            f"Config not found: {CONFIG_FILE}\n"
+            "Create it with:\n\n"
+            'client_id = "YOUR_CLIENT_ID"\n'
+            'playlist_id = ""\n'
+            'redirect_uri = "http://127.0.0.1:8888/callback"\n'
+        )
+    with CONFIG_FILE.open("rb") as f:
+        return tomllib.load(f)
+
+
+def require_config_key(config: dict[str, Any], key: str) -> str:
+    value = config.get(key)
+    if not value:
+        raise RuntimeError(
+            f"Missing '{key}' in {CONFIG_FILE}. "
+            f"Please set it and try again."
+        )
+    return str(value)
+
+
+def load_token() -> dict[str, Any] | None:
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        with TOKEN_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_token(token: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with TOKEN_FILE.open("w", encoding="utf-8") as f:
+        json.dump(token, f, indent=2)
+    os.chmod(TOKEN_FILE, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# Spotify API helpers
+# ---------------------------------------------------------------------------
+
+def spotify_request(
+    endpoint: str,
+    token: dict[str, Any],
+    method: str = "GET",
+    data: dict[str, Any] | None = None,
+    params: dict[str, str] | None = None,
+) -> dict[str, Any] | list[Any]:
+    url = f"{SPOTIFY_API_BASE}{endpoint}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    headers = {
+        "Authorization": f"Bearer {token['access_token']}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps(data).encode("utf-8") if data else None
+
+    req = urllib.request.Request(
+        url, data=body, headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return {}
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            err = {}
+        raise RuntimeError(
+            f"Spotify API error {e.code}: {err.get('error', {}).get('message', e.reason)}"
+        )
+
+
+def refresh_token(config: dict[str, Any], token: dict[str, Any]) -> dict[str, Any]:
+    """Refresh the access token using the stored refresh_token."""
+    refresh = token.get("refresh_token")
+    if not refresh:
+        raise RuntimeError(
+            "No refresh token stored. Run 'songrec-spotify auth' again."
+        )
+
+    client_id = require_config_key(config, "client_id")
+    data = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        SPOTIFY_TOKEN_URL,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new_token = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            err = {}
+        raise RuntimeError(
+            f"Token refresh failed ({e.code}): "
+            f"{err.get('error_description', e.reason)}. Run 'songrec-spotify auth'."
+        )
+
+    merged = dict(token)
+    merged.update(new_token)
+    if "refresh_token" not in merged:
+        merged["refresh_token"] = refresh
+    merged["obtained_at"] = int(time.time())
+    save_token(merged)
+    return merged
+
+
+def ensure_token(config: dict[str, Any]) -> dict[str, Any]:
+    token = load_token()
+    if not token:
+        raise RuntimeError(
+            "Not authenticated. Run 'songrec-spotify auth' first."
+        )
+
+    expires_in = token.get("expires_in", 3600)
+    obtained_at = token.get("obtained_at", 0)
+    if int(time.time()) >= obtained_at + expires_in - 300:
+        return refresh_token(config, token)
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Authorization code + PKCE flow
+# ---------------------------------------------------------------------------
+
+def pkce_pair() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(
+        secrets.token_bytes(64)
+    ).decode("ascii").rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).decode("ascii").rstrip("=")
+    return verifier, challenge
+
+
+class CallbackHandler(http.server.BaseHTTPRequestHandler):
+    """Handle the OAuth redirect and return the auth code to the caller."""
+
+    state: str | None = None
+    _result: dict[str, str | None] = {"code": None, "error": None}
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if "error" in params:
+            CallbackHandler._result["error"] = params["error"][0]
+            self._send_error(f"Authorization error: {params['error'][0]}")
+            return
+
+        if CallbackHandler.state is None or params.get("state", [None])[0] != CallbackHandler.state:
+            CallbackHandler._result["error"] = "state_mismatch"
+            self._send_error("State mismatch. Authorization failed.")
+            return
+
+        if "code" in params:
+            CallbackHandler._result["code"] = params["code"][0]
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(
+                b"<h1>Spotify auth successful!</h1>"
+                b"<p>You can close this window and return to the terminal.</p>"
+            )
+        else:
+            CallbackHandler._result["error"] = "no_code"
+            self._send_error("No authorization code received.")
+
+    def _send_error(self, message: str):
+        self.send_response(400)
+        self.end_headers()
+        self.wfile.write(f"<h1>{message}</h1>".encode("utf-8"))
+
+    def log_message(self, *args, **kwargs):
+        pass
+
+
+def run_auth_server(port: int = 8888) -> str:
+    CallbackHandler._result = {"code": None, "error": None}
+    server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
+    while CallbackHandler._result["code"] is None and CallbackHandler._result["error"] is None:
+        server.handle_request()
+    server.server_close()
+
+    if CallbackHandler._result["error"]:
+        raise RuntimeError(
+            f"Authorization failed: {CallbackHandler._result['error']}"
+        )
+    code = CallbackHandler._result["code"]
+    if not code:
+        raise RuntimeError("Authorization failed: no code received.")
+    return code
+
+
+def cmd_auth(config: dict[str, Any]) -> int:
+    client_id = require_config_key(config, "client_id")
+    redirect_uri = config.get("redirect_uri", "http://127.0.0.1:8888/callback")
+    if not redirect_uri.startswith("http://127.0.0.1"):
+        print("Warning: redirect_uri should use 127.0.0.1 for the local flow.")
+
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(16)
+    CallbackHandler.state = state
+
+    auth_params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "scope": REQUIRED_SCOPES,
+        "code_challenge_method": "S256",
+        "code_challenge": challenge,
+    }
+    auth_url = f"{SPOTIFY_AUTH_URL}?{urllib.parse.urlencode(auth_params)}"
+
+    print(f"Authorization URL: {auth_url}")
+    print("Opening browser for Spotify authorization...")
+    open_url(auth_url)
+
+    port = int(urllib.parse.urlparse(redirect_uri).port or 8888)
+    print(f"Waiting for callback on {redirect_uri}...")
+    code = run_auth_server(port)
+
+    data = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": verifier,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        SPOTIFY_TOKEN_URL,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            token = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            err = {}
+        print(
+            f"Failed to exchange code for token: "
+            f"{err.get('error_description', e.reason)}",
+            file=sys.stderr,
+        )
+        notify("Spotify auth failed", str(err.get("error_description", e.reason)), "critical")
+        return 1
+
+    token["obtained_at"] = int(time.time())
+    save_token(token)
+
+    # Fetch user profile for display
+    try:
+        me = spotify_request("/me", ensure_token(config))
+        display_name = me.get("display_name") or me.get("id")
+        print(f"Authenticated as {display_name}")
+        notify("Spotify connected", f"Authenticated as {display_name}")
+    except Exception as e:
+        print("Authenticated, but could not fetch profile.", file=sys.stderr)
+        notify("Spotify connected", "Token saved successfully")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Playlist management
+# ---------------------------------------------------------------------------
+
+def fetch_owned_playlists(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """Return (owned_playlists, current_user_id)."""
+    token = ensure_token(config)
+    me = spotify_request("/me", token)
+    my_id = me.get("id")
+    if not my_id:
+        raise RuntimeError("Could not determine Spotify user id.")
+
+    playlists: list[dict[str, Any]] = []
+    limit = 50
+    offset = 0
+    while True:
+        resp = spotify_request(
+            "/me/playlists",
+            token,
+            params={"limit": str(limit), "offset": str(offset)},
+        )
+        page = resp.get("items", [])
+        if not page:
+            break
+        playlists.extend(page)
+        if len(page) < limit:
+            break
+        offset += limit
+
+    owned = [pl for pl in playlists if pl.get("owner", {}).get("id") == my_id]
+    return owned, my_id
+
+
+def cmd_list_playlists(config: dict[str, Any], *, json_output: bool = False) -> int:
+    owned, _ = fetch_owned_playlists(config)
+
+    if json_output:
+        out = [
+            {
+                "id": pl.get("id", ""),
+                "name": pl.get("name", "(unknown)"),
+                "track_count": pl.get("tracks", {}).get("total"),
+            }
+            for pl in owned
+        ]
+        print(json.dumps(out))
+        return 0
+
+    if not owned:
+        print("No playlists found.")
+        return 0
+
+    print(f"{'#':<4} {'Name':<40} {'ID':<30}")
+    print("-" * 80)
+    for idx, pl in enumerate(owned, start=1):
+        name = pl.get("name", "(unknown)")
+        pid = pl.get("id", "")
+        print(f"{idx:<4} {name:<40} {pid:<30}")
+    return 0
+
+
+def cmd_select_playlist(config: dict[str, Any], playlist_id: str | None = None) -> int:
+    created_ids = get_created_playlist_ids()
+
+    if playlist_id:
+        # Non-interactive: trust IDs created by this helper; otherwise verify ownership.
+        if playlist_id not in created_ids:
+            owned, _ = fetch_owned_playlists(config)
+            if not any(pl.get("id") == playlist_id for pl in owned):
+                print(
+                    f"Playlist ID '{playlist_id}' is not owned by you or does not exist.",
+                    file=sys.stderr,
+                )
+                return 1
+    else:
+        # Interactive mode: show all owned playlists
+        owned, _ = fetch_owned_playlists(config)
+
+        if not owned:
+            print("No playlists you own were found. Use 'create-playlist' first.")
+            return 1
+
+        for idx, pl in enumerate(owned, start=1):
+            print(f"{idx}. {pl.get('name')} ({pl.get('tracks', {}).get('total', '?')} tracks)")
+
+        try:
+            choice = input("Select playlist number or paste a playlist ID: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return 1
+
+        if re.fullmatch(r"\d+", choice):
+            num = int(choice)
+            if 1 <= num <= len(owned):
+                playlist_id = owned[num - 1].get("id", "")
+            else:
+                print("Invalid number.")
+                return 1
+        elif re.fullmatch(r"[A-Za-z0-9]+", choice):
+            playlist_id = choice
+        else:
+            print("Invalid input.")
+            return 1
+
+    if not playlist_id:
+        print("Could not determine playlist ID.")
+        return 1
+
+    write_config_playlist_id(playlist_id)
+    print(f"Saved playlist_id = {playlist_id}")
+    return 0
+
+
+def write_config_playlist_id(playlist_id: str) -> None:
+    """Update playlist_id in config.toml while preserving other keys."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config_text = ""
+    if CONFIG_FILE.exists():
+        config_text = CONFIG_FILE.read_text(encoding="utf-8")
+
+    # Match both double and single quoted values, and bare-ish assignments.
+    pattern = r"^(\s*playlist_id\s*=\s*)['\"]?[^'\"\n]*['\"]?"
+    replacement = rf'\1"{playlist_id}"'
+    if re.search(pattern, config_text, flags=re.MULTILINE):
+        config_text = re.sub(
+            pattern, replacement, config_text, count=1, flags=re.MULTILINE
+        )
+    else:
+        config_text += f'\nplaylist_id = "{playlist_id}"\n'
+
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(config_text, encoding="utf-8")
+    tmp.replace(CONFIG_FILE)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def read_config_raw() -> dict[str, Any]:
+    """Read config.toml as a raw dictionary (used for keys beyond load_config)."""
+    if not CONFIG_FILE.exists():
+        return {}
+    with CONFIG_FILE.open("rb") as f:
+        return tomllib.load(f)
+
+
+def write_config_key(key: str, value: Any) -> None:
+    """Write or update a single top-level config key, preserving the rest of the file."""
+    config = read_config_raw()
+    config[key] = value
+    lines: list[str] = []
+    if CONFIG_FILE.exists():
+        lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+
+    # Remove any existing occurrence of the key.
+    lines = [line for line in lines if not re.match(rf"^\s*{re.escape(key)}\s*=", line)]
+
+    # Append the key using TOML array syntax for lists, quoted string for strings.
+    if isinstance(value, list):
+        array_body = ", ".join(json.dumps(str(v)) for v in value)
+        lines.append(f"{key} = [{array_body}]")
+    elif isinstance(value, str):
+        safe = value.replace('"', '\\"')
+        lines.append(f'{key} = "{safe}"')
+    else:
+        lines.append(f"{key} = {value}")
+
+    config_text = "\n".join(lines).rstrip() + "\n"
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(config_text, encoding="utf-8")
+    tmp.replace(CONFIG_FILE)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def record_created_playlist(playlist_id: str) -> None:
+    """Append a newly created playlist ID to created_playlists in config."""
+    config = read_config_raw()
+    created: list[str] = config.get("created_playlists", []) or []
+    if playlist_id not in created:
+        created.append(playlist_id)
+    write_config_key("created_playlists", created)
+
+
+def get_created_playlist_ids() -> list[str]:
+    """Return playlist IDs that were created via this helper."""
+    config = read_config_raw()
+    created = config.get("created_playlists", []) or []
+    if isinstance(created, list):
+        return [str(item) for item in created if item]
+    return []
+
+
+def cmd_get_created_playlists(config: dict[str, Any], *, json_output: bool = False) -> int:
+    """List playlists created by this helper, optionally as JSON."""
+    ids = get_created_playlist_ids()
+    if not ids:
+        if json_output:
+            print("[]")
+        else:
+            print("No playlists have been created via songrec-spotify yet.")
+        return 0
+
+    token = ensure_token(config)
+    result: list[dict[str, Any]] = []
+    for pid in ids:
+        try:
+            pl = spotify_request(f"/playlists/{pid}", token, params={"fields": "id,name,tracks(total)"})
+            result.append(
+                {
+                    "id": pl.get("id", pid),
+                    "name": pl.get("name", "(unknown)"),
+                    "track_count": pl.get("tracks", {}).get("total"),
+                }
+            )
+        except Exception as e:
+            result.append({"id": pid, "name": "(unavailable)", "track_count": None})
+
+    if json_output:
+        print(json.dumps(result))
+    else:
+        for idx, pl in enumerate(result, start=1):
+            print(f"{idx}. {pl['name']} ({pl['track_count'] or '?'} tracks) - {pl['id']}")
+    return 0
+
+
+def write_initial_config(client_id: str) -> None:
+    """Create a fresh config.toml with the user-supplied Client ID."""
+    if CONFIG_FILE.exists():
+        raise RuntimeError(
+            f"Config already exists: {CONFIG_FILE}\n"
+            "Edit it directly instead of running init again."
+        )
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Defensively quote the client_id in case input contains TOML special chars.
+    safe_client_id = client_id.replace('"', '\\"')
+    config_text = (
+        f'client_id = "{safe_client_id}"\n'
+        f'playlist_id = ""\n'
+        f'redirect_uri = "http://127.0.0.1:8888/callback"\n'
+    )
+    CONFIG_FILE.write_text(config_text, encoding="utf-8")
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def cmd_init() -> int:
+    """Create initial config.toml interactively."""
+    if CONFIG_FILE.exists():
+        print(
+            f"Config already exists at {CONFIG_FILE}.\n"
+            "Edit it directly or delete it before running init again.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        client_id = input("Spotify Client ID: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return 1
+
+    if not client_id:
+        print("Client ID cannot be empty.", file=sys.stderr)
+        return 1
+
+    write_initial_config(client_id)
+    print(f"Created {CONFIG_FILE}")
+    print("\nNext steps:")
+    print("  1. Create a Spotify app at https://developer.spotify.com/dashboard")
+    print("  2. Add redirect URI: http://127.0.0.1:8888/callback")
+    print("  3. Run: songrec-spotify auth")
+    return 0
+
+
+def cmd_create_playlist(config: dict[str, Any], name: str) -> int:
+    token = ensure_token(config)
+    me = spotify_request("/me", token)
+    user_id = me.get("id")
+    if not user_id:
+        print("Could not determine Spotify user id.", file=sys.stderr)
+        return 1
+
+    resp = spotify_request(
+        f"/users/{user_id}/playlists",
+        token,
+        method="POST",
+        data={
+            "name": name,
+            "public": False,
+            "description": "Songs added from SongRec via quickshell",
+        },
+    )
+    playlist_id = resp.get("id")
+    if not playlist_id:
+        print("Playlist creation failed.", file=sys.stderr)
+        return 1
+
+    write_config_playlist_id(playlist_id)
+    record_created_playlist(playlist_id)
+    print(f"Created playlist '{name}' and saved playlist_id = {playlist_id}")
+    notify("Spotify playlist created", f"'{name}' is now the target playlist")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Track parsing, search and matching
+# ---------------------------------------------------------------------------
+
+def normalize_text(text: str) -> str:
+    """Lowercase, strip accents/diacritics, remove common suffixes, collapse spaces."""
+    text = text.lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+
+    # Remove parenthetical/bracket suffixes like (Remix), [Live], etc.
+    text = re.sub(r"[\[(].*?[\])]", " ", text)
+
+    # Strip common featuring/versions indicators
+    text = re.sub(
+        r"\b(feat\.?|ft\.?|featuring|with|prod\.?|produced by)\b.*?(?=\s+-\s+|$)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(remix|edit|extended mix|radio edit|mix|version|live|acoustic|instrumental)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Keep only alphanumerics and whitespace
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split())
+
+
+def parse_track(text: str) -> tuple[str, str]:
+    """Parse 'Artist - Title' or 'Artist – Title' into (artist, title)."""
+    text = text.strip()
+    # Try unicode en-dash first, then ascii hyphen
+    for sep in ("–", "-"):
+        if sep in text:
+            parts = text.split(sep, 1)
+            artist = parts[0].strip()
+            title = parts[1].strip()
+            if artist and title:
+                return artist, title
+    # If no separator, assume the whole string is the title
+    return "", text
+
+
+def search_tracks(config: dict[str, Any], artist: str, title: str) -> list[dict[str, Any]]:
+    token = ensure_token(config)
+    query = f"track:{title} artist:{artist}"
+    resp = spotify_request(
+        "/search",
+        token,
+        params={
+            "q": query,
+            "type": "track",
+            "limit": "10",
+        },
+    )
+    return resp.get("tracks", {}).get("items", [])
+
+
+def is_confident_match(
+    artist_query: str, title_query: str, track: dict[str, Any]
+) -> tuple[bool, float, str]:
+    """Return (passes, score, reason) using separate artist/title thresholds."""
+    q_artist = normalize_text(artist_query)
+    s_title = normalize_text(track.get("name", ""))
+    s_artists = [
+        normalize_text(a.get("name", ""))
+        for a in track.get("artists", [])
+        if a.get("name")
+    ]
+
+    artist_score = 0.0
+    best_artist = ""
+    for a in s_artists:
+        if a == q_artist:
+            artist_score = 1.0
+            best_artist = a
+            break
+        if q_artist in a or a in q_artist:
+            overlap = len(set(q_artist.split()) & set(a.split())) / max(
+                len(q_artist.split()), len(a.split()), 1
+            )
+            if overlap > artist_score:
+                artist_score = overlap
+                best_artist = a
+
+    title_score = 0.0
+    q_title = normalize_text(title_query)
+    if s_title == q_title:
+        title_score = 1.0
+    elif q_title in s_title:
+        title_score = 0.9
+    elif s_title in q_title:
+        title_score = 0.8
+    else:
+        q_tokens = set(q_title.split())
+        s_tokens = set(s_title.split())
+        if q_tokens:
+            overlap = len(q_tokens & s_tokens) / len(q_tokens)
+            if overlap >= 0.5:
+                title_score = overlap
+
+    score = artist_score * title_score
+    reason = (
+        f"artist='{best_artist}' ({artist_score:.2f}), title='{s_title}' ({title_score:.2f})"
+    )
+
+    passes = artist_score >= 0.5 and title_score >= 0.5 and score >= 0.6
+    return passes, score, reason
+
+
+def find_best_match(
+    artist: str, title: str, candidates: list[dict[str, Any]]
+) -> tuple[dict[str, Any] | None, bool, float, str]:
+    best: dict[str, Any] | None = None
+    best_score = 0.0
+    best_reason = ""
+    best_passes = False
+    for track in candidates:
+        passes, score, reason = is_confident_match(artist, title, track)
+        if score > best_score:
+            best_score = score
+            best = track
+            best_reason = reason
+            best_passes = passes
+    return best, best_passes, best_score, best_reason
+
+
+# ---------------------------------------------------------------------------
+# Duplicate check and add
+# ---------------------------------------------------------------------------
+
+def playlist_contains_track(
+    config: dict[str, Any], token: dict[str, Any], playlist_id: str, track_uri: str
+) -> bool:
+    limit = 100
+    offset = 0
+    max_pages = 50  # cap at 5,000 tracks for very large playlists
+    pages = 0
+    while pages < max_pages:
+        resp = spotify_request(
+            f"/playlists/{playlist_id}/tracks",
+            token,
+            params={"limit": str(limit), "offset": str(offset), "fields": "items(track(uri)),next"},
+        )
+        items = resp.get("items", [])
+        for item in items:
+            track = item.get("track")
+            if track and track.get("uri") == track_uri:
+                return True
+        if not resp.get("next") or len(items) < limit:
+            break
+        offset += limit
+        pages += 1
+    return False
+
+
+def cmd_add(
+    config: dict[str, Any],
+    track_text: str,
+    *,
+    dry_run: bool = False,
+) -> int:
+    artist, title = parse_track(track_text)
+    if not artist and not title:
+        print("Could not parse track text.", file=sys.stderr)
+        notify("SongRec Spotify", "Could not parse track text", "critical")
+        return 1
+
+    print(f"Searching: artist='{artist}' title='{title}'")
+    candidates = search_tracks(config, artist, title)
+    if not candidates:
+        print("No Spotify results found.")
+        notify("SongRec Spotify", "No Spotify results found", "normal")
+        return 0
+
+    best, passes, score, reason = find_best_match(artist, title, candidates)
+    if best is None:
+        print("No candidates returned.")
+        return 1
+
+    track_name = best.get("name", "Unknown")
+    track_artist = ", ".join(a.get("name", "") for a in best.get("artists", []))
+    track_uri = best.get("uri")
+    track_url = best.get("external_urls", {}).get("spotify")
+
+    print(f"Best match: '{track_name}' by {track_artist}")
+    print(f"Confidence: {score:.2f} ({reason})")
+    if not track_uri:
+        print("Best match has no Spotify URI. Cannot add.", file=sys.stderr)
+        notify("SongRec Spotify", "Match has no Spotify URI", "critical")
+        return 1
+    print(f"URI: {track_uri}")
+    if track_url:
+        print(f"URL: {track_url}")
+
+    if not passes:
+        print("Skipped: no confident artist + title match.")
+        notify("SongRec Spotify", "No confident match; skipped", "normal")
+        return 0
+
+    playlist_id = config.get("playlist_id", "")
+    if not playlist_id:
+        print(
+            "No playlist_id configured. Run 'songrec-spotify select-playlist' or "
+            "'songrec-spotify create-playlist <name>'.",
+            file=sys.stderr,
+        )
+        notify("SongRec Spotify", "No playlist configured", "critical")
+        return 1
+
+    token = ensure_token(config)
+
+    # Fetch playlist name for nicer output
+    try:
+        pl = spotify_request(f"/playlists/{playlist_id}", token, params={"fields": "name"})
+        playlist_name = pl.get("name", "(unknown)")
+    except Exception:
+        playlist_name = "(unknown)"
+
+    if dry_run:
+        print(f"[test mode] Would add to playlist '{playlist_name}'.")
+        return 0
+
+    if playlist_contains_track(config, token, playlist_id, track_uri):
+        print(f"Already in playlist '{playlist_name}'. Not added.")
+        notify("SongRec Spotify", f"'{track_name}' already in playlist", "normal")
+        return 0
+
+    spotify_request(
+        f"/playlists/{playlist_id}/tracks",
+        token,
+        method="POST",
+        data={"uris": [track_uri]},
+    )
+    print(f"Added '{track_name}' by {track_artist} to playlist '{playlist_name}'.")
+    notify(
+        "SongRec Spotify",
+        f"Added '{track_name}' by {track_artist}",
+        "normal",
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv or sys.argv[1:]
+    parser = argparse.ArgumentParser(
+        prog="songrec-spotify",
+        description="Add SongRec-recognized songs to a Spotify playlist.",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        dest="no_notify",
+        help="Suppress desktop notifications (useful when caller shows its own)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init", help="Create initial config interactively")
+    sub.add_parser("auth", help="Authorize with Spotify via browser/PKCE")
+    list_p = sub.add_parser("list-playlists", help="List your Spotify playlists")
+    list_p.add_argument(
+        "--json", action="store_true", help="Output as JSON"
+    )
+    select_p = sub.add_parser("select-playlist", help="Pick a playlist")
+    select_p.add_argument(
+        "playlist_id", nargs="?", help="Playlist ID to set (optional)"
+    )
+    get_created_p = sub.add_parser(
+        "get-created-playlists", help="List playlists created by this helper"
+    )
+    get_created_p.add_argument(
+        "--json", action="store_true", help="Output as JSON"
+    )
+    create_p = sub.add_parser("create-playlist", help="Create a new playlist")
+    create_p.add_argument("name", help="Name for the new playlist")
+
+    add_p = sub.add_parser("add", help="Add a track to the configured playlist")
+    add_p.add_argument("track", nargs="?", help='Track text, e.g. "Artist - Title"')
+    add_p.add_argument(
+        "--from-clipboard",
+        action="store_true",
+        help="Read track text from clipboard",
+    )
+
+    test_p = sub.add_parser("test", help="Test matching without adding")
+    test_p.add_argument("track", help='Track text, e.g. "Artist - Title"')
+
+    args = parser.parse_args(argv)
+
+    global NO_NOTIFY
+    NO_NOTIFY = args.no_notify
+
+    try:
+        if args.command == "init":
+            return cmd_init()
+
+        if args.command == "auth":
+            return cmd_auth(load_config())
+
+        if args.command == "list-playlists":
+            return cmd_list_playlists(load_config(), json_output=args.json)
+
+        if args.command == "select-playlist":
+            return cmd_select_playlist(load_config(), args.playlist_id)
+
+        if args.command == "get-created-playlists":
+            return cmd_get_created_playlists(load_config(), json_output=args.json)
+
+        if args.command == "create-playlist":
+            return cmd_create_playlist(load_config(), args.name)
+
+        if args.command in ("add", "test"):
+            if args.command == "add" and args.from_clipboard:
+                if args.track:
+                    parser.error(
+                        "Cannot use --from-clipboard together with a track argument."
+                    )
+                track_text = read_clipboard()
+            elif args.command == "add" and args.track:
+                track_text = args.track
+            elif args.command == "test":
+                track_text = args.track
+            else:
+                parser.print_help()
+                return 1
+
+            if not track_text:
+                print("No track text provided.", file=sys.stderr)
+                return 1
+
+            return cmd_add(load_config(), track_text, dry_run=(args.command == "test"))
+
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        if not NO_NOTIFY:
+            notify("songrec-spotify error", str(e), "critical")
+        return 1
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        if not NO_NOTIFY:
+            notify("songrec-spotify error", str(e), "critical")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
